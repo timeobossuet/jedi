@@ -1,0 +1,1406 @@
+<script>
+// ════════════════════════════════════════════════════════
+//  STATE
+// ════════════════════════════════════════════════════════
+let sgMembres    = [];
+let sgReunions   = [];
+let sgVotes      = [];
+let sgFiltre     = 'tous';
+let sgSearch     = '';
+let membreEnCours  = null;
+let reunionEnCours = null;
+let vueActuelle    = 'membres';
+let reunionDetailId = null;
+let _initialLoadDone = false;
+
+const APP_PAGE_KEY = 'sg';
+const SUPPORT_LINKS = window.__JEDI_SUPPORT_LINKS__ || {};
+const DSI_CHAT_URL = String(SUPPORT_LINKS.dsiChatUrl || 'https://chat.google.com/room/AAQAMCtOHjs');
+const DSI_TICKETS_URL = String(SUPPORT_LINKS.dsiTicketsUrl || DSI_CHAT_URL);
+const SG_ERROR_LOG_LIMIT = 60;
+const SG_ERROR_DIALOG_COOLDOWN_MS = 15000;
+
+let sgErrorLogs = [];
+let sgLastErrorFingerprint = '';
+let sgLastErrorAt = 0;
+let _jModalCb = null;
+
+function escapeHtmlSg_(value) {
+  return String(value || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
+function escapeHtmlAttrSg_(value) {
+  return escapeHtmlSg_(value);
+}
+
+function stripHtmlSg_(value) {
+  return String(value || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function stringifySgErrorValue_(value) {
+  if (value === null || value === undefined) return '';
+  if (value instanceof Error) return value.stack || value.message || String(value);
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value); }
+    catch (e) { return String(value); }
+  }
+  return String(value);
+}
+
+function pushSgErrorLog_(level, message, location) {
+  sgErrorLogs.push({
+    at: new Date().toISOString(),
+    level: String(level || 'info'),
+    message: String(message || '').slice(0, 500),
+    location: String(location || '').slice(0, 200)
+  });
+
+  if (sgErrorLogs.length > SG_ERROR_LOG_LIMIT) {
+    sgErrorLogs = sgErrorLogs.slice(sgErrorLogs.length - SG_ERROR_LOG_LIMIT);
+  }
+}
+
+function normalizeSgError_(errorLike) {
+  if (errorLike instanceof Error) {
+    return {
+      message: errorLike.message || String(errorLike),
+      stack: errorLike.stack || ''
+    };
+  }
+
+  if (errorLike && typeof errorLike === 'object') {
+    return {
+      message: errorLike.message ? String(errorLike.message) : stringifySgErrorValue_(errorLike),
+      stack: errorLike.stack ? String(errorLike.stack) : ''
+    };
+  }
+
+  return {
+    message: String(errorLike || 'Erreur inconnue'),
+    stack: ''
+  };
+}
+
+function buildSgErrorFingerprint_(payload) {
+  if (!payload || typeof payload !== 'object') return 'unknown';
+  return [payload.page || '', payload.location || '', payload.source || '', payload.message || ''].join('|').toLowerCase();
+}
+
+function shouldThrottleSgErrorDialog_(fingerprint) {
+  const now = Date.now();
+  if (fingerprint && fingerprint === sgLastErrorFingerprint && (now - sgLastErrorAt) < SG_ERROR_DIALOG_COOLDOWN_MS) {
+    return true;
+  }
+  sgLastErrorFingerprint = fingerprint;
+  sgLastErrorAt = now;
+  return false;
+}
+
+function buildSgTicketPayload_(errorLike, meta) {
+  const normalizedError = normalizeSgError_(errorLike);
+  const options = meta && typeof meta === 'object' ? meta : {};
+
+  return {
+    page: APP_PAGE_KEY,
+    pageTitle: document.title || '',
+    source: options.source || 'frontend',
+    location: options.location || '',
+    url: window.location.href,
+    message: normalizedError.message || 'Erreur inconnue',
+    stack: normalizedError.stack || '',
+    userMessage: options.userMessage || '',
+    userAgent: navigator.userAgent || '',
+    build: window.__JEDI_SG_BUILD__ || '',
+    currentStudyId: '',
+    currentTab: vueActuelle || '',
+    logs: sgErrorLogs.slice(-25),
+    occurredAt: new Date().toISOString(),
+    extra: options.extra && typeof options.extra === 'object' ? options.extra : undefined
+  };
+}
+
+function sendSgTicket_(ticketPayload) {
+  return new Promise(function(resolve) {
+    google.script.run
+      .withSuccessHandler(function(result) {
+        resolve(result && typeof result === 'object' ? result : { success: false, error: 'Réponse serveur invalide.' });
+      })
+      .withFailureHandler(function(err) {
+        const normalized = normalizeSgError_(err);
+        resolve({
+          success: false,
+          error: normalized.message || 'Erreur inconnue',
+          chatUrl: DSI_CHAT_URL,
+          ticketsUrl: DSI_TICKETS_URL
+        });
+      })
+      .signalerErreurDsi(ticketPayload || {});
+  });
+}
+
+function jModal(params) {
+  const options = params && typeof params === 'object' ? params : {};
+  _jModalCb = {
+    onConfirm: options.onConfirm || null,
+    onCancel: options.onCancel || null
+  };
+
+  const types = {
+    info:    { icon: 'fa-info-circle',          bg: 'bg-blue-100 text-blue-600' },
+    danger:  { icon: 'fa-exclamation-triangle', bg: 'bg-red-100 text-red-600' },
+    success: { icon: 'fa-check-circle',         bg: 'bg-green-100 text-green-600' },
+    warning: { icon: 'fa-exclamation-circle',   bg: 'bg-amber-100 text-amber-600' }
+  };
+
+  const typeCfg = types[options.type || 'info'] || types.info;
+  const iconEl = document.getElementById('jmodal-icon');
+  const titleEl = document.getElementById('jmodal-title');
+  const messageEl = document.getElementById('jmodal-message');
+  const confirmBtn = document.getElementById('jmodal-confirm');
+  const cancelBtn = document.getElementById('jmodal-cancel');
+  const overlay = document.getElementById('jmodal-overlay');
+
+  if (!iconEl || !titleEl || !messageEl || !confirmBtn || !cancelBtn || !overlay) {
+    const fallback = (options.title ? options.title + ': ' : '') + stripHtmlSg_(options.message || '');
+    if (window.__JEDI_NATIVE_ALERT__) {
+      window.__JEDI_NATIVE_ALERT__(fallback);
+      return;
+    }
+    return;
+  }
+
+  iconEl.className = 'w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 ' + typeCfg.bg;
+  iconEl.innerHTML = '<i class="fas ' + typeCfg.icon + '"></i>';
+  titleEl.textContent = options.title || '';
+  messageEl.innerHTML = options.message || '';
+
+  confirmBtn.textContent = options.confirmText || 'OK';
+  confirmBtn.className = 'px-5 py-2 text-sm font-semibold text-white rounded-xl transition-colors ' +
+    (options.danger ? 'bg-red-500 hover:bg-red-600' : 'bg-violet-600 hover:bg-violet-700');
+
+  if (options.cancelText) {
+    cancelBtn.textContent = options.cancelText;
+    cancelBtn.classList.remove('hidden');
+  } else {
+    cancelBtn.classList.add('hidden');
+  }
+
+  overlay.classList.remove('hidden');
+  overlay.classList.add('flex');
+}
+
+function jModalConfirm() {
+  const overlay = document.getElementById('jmodal-overlay');
+  if (overlay) {
+    overlay.classList.remove('flex');
+    overlay.classList.add('hidden');
+  }
+  const cb = _jModalCb;
+  _jModalCb = null;
+  if (cb && cb.onConfirm) cb.onConfirm();
+}
+
+function jModalCancel() {
+  const overlay = document.getElementById('jmodal-overlay');
+  if (overlay) {
+    overlay.classList.remove('flex');
+    overlay.classList.add('hidden');
+  }
+  const cb = _jModalCb;
+  _jModalCb = null;
+  if (cb && cb.onCancel) cb.onCancel();
+}
+
+function jAlert(message, title, type, opts) {
+  const options = opts && typeof opts === 'object' ? opts : {};
+  const alertType = type || 'info';
+  const alertTitle = title || 'Information';
+
+  if (alertType === 'danger' && options.disableDsi !== true) {
+    const payload = options.ticketPayload || buildSgTicketPayload_(options.error || stripHtmlSg_(message), {
+      source: options.source || 'ui',
+      location: options.location || 'jAlert',
+      userMessage: options.userMessage || stripHtmlSg_(message)
+    });
+
+    return new Promise(function(resolve) {
+      jModal({
+        title: alertTitle,
+        message: message,
+        type: 'danger',
+        danger: true,
+        confirmText: options.confirmText || 'Contacter le DSI',
+        cancelText: options.cancelText || 'Fermer',
+        onConfirm: function() {
+          sendSgTicket_(payload).then(function(result) {
+            const sent = !!(result && result.success);
+            if (sent) {
+              const ticketId = escapeHtmlSg_(result.ticketId || '');
+              jModal({
+                title: 'Ticket envoyé',
+                message: 'Le ticket <strong>' + ticketId + '</strong> a été transmis au DSI.<br>' +
+                  '<a href="' + escapeHtmlAttrSg_(result.ticketsUrl || DSI_TICKETS_URL) + '" target="_blank" rel="noopener noreferrer" class="text-violet-600 hover:underline">Ouvrir le chat tickets</a>',
+                type: 'success',
+                confirmText: 'OK',
+                onConfirm: resolve
+              });
+              return;
+            }
+
+            const reason = escapeHtmlSg_((result && result.error) ? result.error : 'Impossible d\'envoyer le ticket automatiquement.');
+            jModal({
+              title: 'Envoi impossible',
+              message: 'Le ticket na pas pu etre envoye automatiquement.<br>' +
+                '<span class="text-xs text-gray-500">' + reason + '</span><br>' +
+                '<a href="' + escapeHtmlAttrSg_(DSI_CHAT_URL) + '" target="_blank" rel="noopener noreferrer" class="text-violet-600 hover:underline">Contacter le DSI dans Google Chat</a>',
+              type: 'warning',
+              confirmText: 'OK',
+              onConfirm: resolve
+            });
+          });
+        },
+        onCancel: resolve
+      });
+    });
+  }
+
+  return new Promise(function(resolve) {
+    jModal({
+      title: alertTitle,
+      message: message,
+      type: alertType,
+      confirmText: options.confirmText || 'OK',
+      onConfirm: resolve
+    });
+  });
+}
+
+function handleSgUiError_(errorLike, meta) {
+  const options = meta && typeof meta === 'object' ? meta : {};
+  const payload = options.ticketPayload || buildSgTicketPayload_(errorLike, options);
+  const fingerprint = buildSgErrorFingerprint_(payload);
+
+  pushSgErrorLog_('error', payload.message || 'Erreur inconnue', payload.location || options.location || '');
+
+  if (options.silent) return;
+  if (shouldThrottleSgErrorDialog_(fingerprint)) return;
+
+  const userMessage = options.userMessage
+    ? escapeHtmlSg_(options.userMessage)
+    : escapeHtmlSg_(payload.message || 'Une erreur technique est survenue.');
+
+  const detailsHtml =
+    '<div class="space-y-3">' +
+      '<p>' + userMessage + '</p>' +
+      '<div class="text-xs text-gray-500 bg-gray-50 border border-gray-200 rounded-lg p-3">' +
+        '<div><strong>Page :</strong> ' + escapeHtmlSg_(payload.page || APP_PAGE_KEY) + '</div>' +
+        '<div><strong>Zone :</strong> ' + escapeHtmlSg_(payload.location || 'Non précisé') + '</div>' +
+      '</div>' +
+      '<p class="text-xs text-gray-500">Tu peux envoyer un ticket détaillé au DSI en un clic.</p>' +
+    '</div>';
+
+  jAlert(detailsHtml, 'Erreur technique', 'danger', {
+    ticketPayload: payload,
+    source: options.source || payload.source || 'frontend',
+    location: payload.location || options.location || 'ui',
+    userMessage: options.userMessage || payload.message,
+    error: errorLike
+  });
+}
+
+function makeSgFailureHandler_(location, userMessage, extraMeta) {
+  return function(err) {
+    const meta = Object.assign({
+      source: 'google.script.run',
+      location: location || '',
+      userMessage: userMessage || ''
+    }, extraMeta || {});
+    handleSgUiError_(err, meta);
+  };
+}
+
+function installSgGlobalErrorHandlers_() {
+  if (window.__JEDI_SG_GLOBAL_ERRORS_INSTALLED__) return;
+  window.__JEDI_SG_GLOBAL_ERRORS_INSTALLED__ = true;
+
+  window.addEventListener('error', function(event) {
+    if (!event) return;
+    const msg = String(event.message || 'Erreur JavaScript');
+    if (/ResizeObserver loop limit exceeded/i.test(msg)) return;
+
+    const location = [event.filename || '', event.lineno || '', event.colno || '']
+      .filter(Boolean)
+      .join(':');
+    const err = event.error || new Error(msg);
+
+    handleSgUiError_(err, {
+      source: 'window.onerror',
+      location: location || 'window',
+      userMessage: 'Une erreur JavaScript inattendue est survenue.'
+    });
+  });
+
+  window.addEventListener('unhandledrejection', function(event) {
+    const reason = event && event.reason ? event.reason : 'Promesse rejetée sans gestionnaire';
+    handleSgUiError_(reason, {
+      source: 'window.unhandledrejection',
+      location: 'promise',
+      userMessage: 'Une promesse a échoué sans gestionnaire côté interface.'
+    });
+  });
+}
+
+function installSgAlertOverride_() {
+  if (window.__JEDI_SG_ALERT_OVERRIDDEN__) return;
+  window.__JEDI_SG_ALERT_OVERRIDDEN__ = true;
+
+  window.__JEDI_NATIVE_ALERT__ = window.alert ? window.alert.bind(window) : null;
+  window.alert = function(message) {
+    const text = String(message || '');
+    const isDanger = /erreur|impossible|echec|échou|failed|exception/i.test(text);
+    return jAlert(escapeHtmlSg_(text).replace(/\n/g, '<br>'), isDanger ? 'Erreur' : 'Information', isDanger ? 'danger' : 'warning', {
+      source: 'window.alert',
+      location: 'window.alert',
+      userMessage: stripHtmlSg_(text),
+      disableDsi: !isDanger
+    });
+  };
+}
+
+(function patchSgConsole_() {
+  if (window.__JEDI_SG_CONSOLE_PATCHED__) return;
+  window.__JEDI_SG_CONSOLE_PATCHED__ = true;
+
+  const originalConsole = {
+    log: console.log ? console.log.bind(console) : function() {},
+    warn: console.warn ? console.warn.bind(console) : function() {},
+    error: console.error ? console.error.bind(console) : function() {}
+  };
+
+  function capture(level, args) {
+    try {
+      const message = Array.prototype.slice.call(args || []).map(stringifySgErrorValue_).join(' | ');
+      pushSgErrorLog_(level, message, 'console');
+    } catch (e) {}
+  }
+
+  console.log = function() {
+    capture('log', arguments);
+    return originalConsole.log.apply(console, arguments);
+  };
+  console.warn = function() {
+    capture('warn', arguments);
+    return originalConsole.warn.apply(console, arguments);
+  };
+  console.error = function() {
+    capture('error', arguments);
+    return originalConsole.error.apply(console, arguments);
+  };
+})();
+
+// ════════════════════════════════════════════════════════
+//  NAVIGATION
+// ════════════════════════════════════════════════════════
+function afficherVue(vue) {
+  ['membres','reunions','votes'].forEach(v => {
+    document.getElementById('view-' + v).classList.toggle('hidden', v !== vue);
+    const nav = document.getElementById('nav-' + v);
+    if (nav) nav.classList.toggle('active', v === vue);
+  });
+  vueActuelle = vue;
+  if (vue === 'votes' && sgVotes.length === 0) chargerVotes();
+}
+
+// ════════════════════════════════════════════════════════
+//  INIT — Chargement groupé (1 seul appel GAS)
+// ════════════════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded', function() {
+  installSgGlobalErrorHandlers_();
+  installSgAlertOverride_();
+
+  chargerTout();
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { fermerModalMembre(); fermerModalReunion(); fermerModalVote(); }
+  });
+});
+
+function chargerTout() {
+  setLoadingState('membres', true);
+  setLoadingState('reunions', true);
+
+  // Un seul appel GAS pour membres + réunions
+  google.script.run
+    .withSuccessHandler(function(data) {
+      sgMembres  = data.membres  || [];
+      sgReunions = data.reunions || [];
+      _initialLoadDone = true;
+      setLoadingState('membres',  false);
+      setLoadingState('reunions', false);
+      afficherMembres();
+      afficherKPIsMembres();
+      afficherReunions();
+    })
+    .withFailureHandler(function(err) {
+      setLoadingState('membres',  false);
+      setLoadingState('reunions', false);
+      showError('Erreur de chargement: ' + (err.message || err));
+    })
+    .chargerToutDonneesSG();
+}
+
+function setLoadingState(vue, loading) {
+  const loader = document.getElementById(vue + '-loader');
+  if (!loader) return;
+  if (loading) loader.classList.remove('hidden');
+  else         loader.classList.add('hidden');
+}
+
+function showError(msg) {
+  handleSgUiError_(msg, {
+    source: 'frontend',
+    location: 'showError',
+    userMessage: String(msg || 'Erreur inconnue')
+  });
+}
+
+// ════════════════════════════════════════════════════════
+//  MEMBRES — AFFICHAGE
+// ════════════════════════════════════════════════════════
+function afficherKPIsMembres() {
+  const actifs       = sgMembres.filter(m => m.statut === 'Actif').length;
+  const intervenants = sgMembres.filter(m => m.statut === 'Intervenant').length;
+  const kiwi         = sgMembres.filter(m => m.checklist && m.checklist.kiwi).length;
+  const ba           = sgMembres.filter(m => m.checklist && m.checklist.ba_signe).length;
+
+  document.getElementById('kpi-membres').innerHTML = [
+    { label: 'Membres actifs',    value: actifs,       icon: 'fa-users',           color: 'bg-indigo-50 text-indigo-600' },
+    { label: 'Intervenants',      value: intervenants, icon: 'fa-person-chalkboard',color: 'bg-amber-50 text-amber-600' },
+    { label: 'Inscrits Kiwi',     value: kiwi + '/' + sgMembres.length, icon: 'fa-leaf',  color: 'bg-teal-50 text-teal-600' },
+    { label: 'BA signés',         value: ba   + '/' + sgMembres.length, icon: 'fa-file-signature', color: 'bg-green-50 text-green-600' }
+  ].map(k => `
+    <div class="bg-white rounded-xl border border-gray-100 p-4 shadow-sm flex items-center space-x-4">
+      <div class="w-10 h-10 ${k.color} rounded-full flex items-center justify-center flex-shrink-0">
+        <i class="fas ${k.icon}"></i>
+      </div>
+      <div>
+        <p class="text-2xl font-bold text-gray-800">${k.value}</p>
+        <p class="text-xs text-gray-500">${k.label}</p>
+      </div>
+    </div>
+  `).join('');
+
+  document.getElementById('membres-count').textContent = sgMembres.length + ' membre' + (sgMembres.length > 1 ? 's' : '');
+}
+
+function afficherMembres() {
+  document.getElementById('membres-loader').classList.add('hidden');
+
+  let filtered = sgMembres.slice();
+  if (sgFiltre !== 'tous') filtered = filtered.filter(m => m.statut === sgFiltre);
+  if (sgSearch.trim()) {
+    const q = sgSearch.toLowerCase();
+    filtered = filtered.filter(m =>
+      (m.nom||'').toLowerCase().includes(q) || (m.prenom||'').toLowerCase().includes(q) ||
+      (m.email||'').toLowerCase().includes(q) || (m.roleCA||'').toLowerCase().includes(q)
+    );
+  }
+
+  document.getElementById('membres-empty').classList.toggle('hidden', filtered.length > 0);
+  const table = document.getElementById('membres-table');
+  table.classList.toggle('hidden', filtered.length === 0);
+
+  // Checklist v2 : 3 étapes (plus de BeeQuick)
+  const checkItems = [
+    { key: 'kiwi',       label: 'Kiwi', title: 'Kiwi (préfecture)' },
+    { key: 'ba_signe',   label: 'BA',   title: 'Bulletin d\'adhésion signé' },
+    { key: 'cotisation', label: 'Cot',  title: 'Cotisation payée' }
+  ];
+
+  document.getElementById('membres-tbody').innerHTML = filtered.map(m => {
+    const cl   = m.checklist || {};
+    const done = checkItems.filter(ci => cl[ci.key]).length;
+    const pct  = Math.round((done / checkItems.length) * 100);
+    const badgeClass = { Actif:'badge-actif', Intervenant:'badge-intervenant', Ancien:'badge-ancien' }[m.statut] || 'badge-ancien';
+
+    return `
+    <tr class="hover:bg-gray-50 cursor-pointer" onclick="ouvrirModalMembre('${m.id}')">
+      <td class="p-4">
+        <div class="flex items-center space-x-3">
+          <div class="w-9 h-9 rounded-full bg-indigo-100 flex items-center justify-center font-bold text-indigo-600 text-sm flex-shrink-0">
+            ${(m.prenom||'?').charAt(0)}${(m.nom||'?').charAt(0)}
+          </div>
+          <div>
+            <p class="font-semibold text-gray-800">${m.civilite?m.civilite+' ':''}${m.prenom||''} ${m.nom||''}</p>
+            <p class="text-xs text-gray-400">${m.dateInscription||''}</p>
+          </div>
+        </div>
+      </td>
+      <td class="p-4">
+        <p class="text-sm font-medium text-gray-700">${m.roleCA||'—'}</p>
+        <p class="text-xs text-gray-400">${m.specialite||''} ${m.promo?'· '+m.promo:''}</p>
+      </td>
+      <td class="p-4">
+        <p class="text-sm text-gray-600">${m.email||'—'}</p>
+        <p class="text-xs text-gray-400">${m.telephone||''}</p>
+      </td>
+      <td class="p-4">
+        <div class="flex items-center justify-center space-x-1">
+          ${checkItems.map(ci => `
+            <span title="${ci.title}" class="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0
+              ${cl[ci.key]?'bg-green-500 text-white':'bg-gray-100 text-gray-400'} cursor-pointer"
+              onclick="event.stopPropagation(); toggleChecklistItem('${m.id}','${ci.key}')">
+              ${cl[ci.key]?'<i class="fas fa-check text-[10px]"></i>':ci.label.charAt(0)}
+            </span>
+          `).join('')}
+          <span class="ml-1 text-xs font-semibold ${pct===100?'text-green-600':'text-gray-400'}">${pct}%</span>
+        </div>
+      </td>
+      <td class="p-4"><span class="inline-flex px-2.5 py-1 rounded-full text-xs font-semibold ${badgeClass}">${m.statut}</span></td>
+      <td class="p-4 text-right">
+        <button class="text-gray-400 hover:text-indigo-600" onclick="event.stopPropagation();ouvrirModalMembre('${m.id}')">
+          <i class="fas fa-pen-to-square"></i>
+        </button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+// ════════════════════════════════════════════════════════
+//  MEMBRES — FILTRES / RECHERCHE
+// ════════════════════════════════════════════════════════
+function filtrerMembres(filtre) {
+  sgFiltre = filtre;
+  document.querySelectorAll('.filtre-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.filtre === filtre));
+  afficherMembres();
+}
+
+function rechercherMembres(val) {
+  sgSearch = val;
+  afficherMembres();
+}
+
+// ════════════════════════════════════════════════════════
+//  MEMBRES — TOGGLE CHECKLIST inline
+// ════════════════════════════════════════════════════════
+function toggleChecklistItem(membreId, key) {
+  const m = sgMembres.find(x => String(x.id) === String(membreId));
+  if (!m) return;
+  if (!m.checklist) m.checklist = { kiwi: false, ba_signe: false, cotisation: false };
+  m.checklist[key] = !m.checklist[key];
+  afficherMembres();
+  google.script.run
+    .withFailureHandler(makeSgFailureHandler_('mettreAJourChecklistMembre', 'La mise à jour de la checklist membre a échoué.'))
+    .mettreAJourChecklistMembre(membreId, m.checklist);
+}
+
+// ════════════════════════════════════════════════════════
+//  MEMBRES — MODAL
+// ════════════════════════════════════════════════════════
+function ouvrirModalMembre(membreId) {
+  const deleteBtn = document.getElementById('btn-delete-membre');
+  const baBtn     = document.getElementById('btn-generer-ba');
+  if (membreId) {
+    membreEnCours = JSON.parse(JSON.stringify(sgMembres.find(m => String(m.id) === String(membreId)) || {}));
+    document.getElementById('modal-membre-title').textContent = 'Modifier le membre';
+    deleteBtn.classList.remove('hidden');
+    if (baBtn) baBtn.classList.remove('hidden');
+  } else {
+    membreEnCours = { id:null, civilite:'', nom:'', prenom:'', email:'', telephone:'',
+      promo:'', specialite:'', roleCA:'', statut:'Actif',
+      checklist: { kiwi:false, ba_signe:false, cotisation:false }, notes:'', adresse:'' };
+    document.getElementById('modal-membre-title').textContent = 'Nouveau membre';
+    deleteBtn.classList.add('hidden');
+    if (baBtn) baBtn.classList.add('hidden');
+  }
+  renderModalMembre();
+  document.getElementById('modal-membre').classList.remove('hidden');
+}
+
+function renderModalMembre() {
+  const m  = membreEnCours || {};
+  const cl = m.checklist   || {};
+
+  const rolesCA = ['','Président(e)','Secrétaire Général(e)','Trésorier(ère)','VP Études',
+    'VP Développement Commercial','VP Communication','VP RH','VP DSI','VP Évènementiel',
+    'VP Partenariats','VP Qualité','Chargé(e) d\'étude','Membre actif'];
+  const statuts = ['Actif','Intervenant','Ancien'];
+
+  // Checklist v2 : 3 étapes sans BeeQuick
+  const checkItems = [
+    { key:'kiwi',       label:'Inscrit sur Kiwi (préfecture)', icon:'fa-leaf' },
+    { key:'ba_signe',   label:'Bulletin d\'adhésion signé',    icon:'fa-file-signature' },
+    { key:'cotisation', label:'Cotisation payée',              icon:'fa-coins' }
+  ];
+
+  document.getElementById('modal-membre-body').innerHTML = `
+    <div class="space-y-5">
+      <div>
+        <h4 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3 flex items-center">
+          <i class="fas fa-user mr-2 text-indigo-400"></i>Identité
+        </h4>
+        <div class="grid grid-cols-3 gap-3">
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Civilité</label>
+            <select id="m-civilite" class="w-full rounded-lg border-gray-200 border text-sm p-2 focus:ring-2 focus:ring-indigo-400 focus:outline-none" onchange="membreEnCours.civilite=this.value">
+              ${['','M.','Mme','Dr','Pr'].map(c=>`<option ${m.civilite===c?'selected':''}>${c}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Nom *</label>
+            <input type="text" value="${esc(m.nom)}" oninput="membreEnCours.nom=this.value.toUpperCase()"
+              class="w-full rounded-lg border-gray-200 border text-sm p-2 focus:ring-2 focus:ring-indigo-400 focus:outline-none uppercase" placeholder="NOM">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Prénom *</label>
+            <input type="text" value="${esc(m.prenom)}" oninput="membreEnCours.prenom=this.value"
+              class="w-full rounded-lg border-gray-200 border text-sm p-2 focus:ring-2 focus:ring-indigo-400 focus:outline-none" placeholder="Prénom">
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <h4 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3 flex items-center">
+          <i class="fas fa-envelope mr-2 text-indigo-400"></i>Contact
+        </h4>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Email</label>
+            <input type="email" value="${esc(m.email)}" oninput="membreEnCours.email=this.value"
+              class="w-full rounded-lg border-gray-200 border text-sm p-2 focus:ring-2 focus:ring-indigo-400 focus:outline-none" placeholder="prenom.nom@etud.insa-toulouse.fr">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Téléphone</label>
+            <input type="text" value="${esc(m.telephone)}" oninput="membreEnCours.telephone=this.value"
+              class="w-full rounded-lg border-gray-200 border text-sm p-2 focus:ring-2 focus:ring-indigo-400 focus:outline-none" placeholder="06XXXXXXXX">
+          </div>
+        </div>
+        <div class="mt-3">
+          <label class="block text-xs text-gray-500 mb-1">Adresse</label>
+          <input type="text" value="${esc(m.adresse||'')}" oninput="membreEnCours.adresse=this.value"
+            class="w-full rounded-lg border-gray-200 border text-sm p-2 focus:ring-2 focus:ring-indigo-400 focus:outline-none" placeholder="Ex: 135 avenue de Rangueil, 31400 Toulouse">
+        </div>
+      </div>
+
+      <div>
+        <h4 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3 flex items-center">
+          <i class="fas fa-id-badge mr-2 text-indigo-400"></i>Infos JIS
+        </h4>
+        <div class="grid grid-cols-4 gap-3">
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Statut</label>
+            <select id="m-statut" class="w-full rounded-lg border-gray-200 border text-sm p-2 focus:ring-2 focus:ring-indigo-400 focus:outline-none" onchange="membreEnCours.statut=this.value">
+              ${statuts.map(s=>`<option ${m.statut===s?'selected':''}>${s}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Promo</label>
+            <input type="text" value="${esc(m.promo)}" oninput="membreEnCours.promo=this.value"
+              class="w-full rounded-lg border-gray-200 border text-sm p-2 focus:ring-2 focus:ring-indigo-400 focus:outline-none" placeholder="2027">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Spécialité</label>
+            <input type="text" value="${esc(m.specialite)}" oninput="membreEnCours.specialite=this.value"
+              class="w-full rounded-lg border-gray-200 border text-sm p-2 focus:ring-2 focus:ring-indigo-400 focus:outline-none" placeholder="GM">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Rôle CA</label>
+            <select class="w-full rounded-lg border-gray-200 border text-sm p-2 focus:ring-2 focus:ring-indigo-400 focus:outline-none" onchange="membreEnCours.roleCA=this.value">
+              ${rolesCA.map(r=>`<option ${m.roleCA===r?'selected':''}>${r}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- Checklist v2 : 3 étapes -->
+      <div>
+        <h4 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3 flex items-center">
+          <i class="fas fa-list-check mr-2 text-green-500"></i>Checklist d'inscription
+        </h4>
+        <div class="bg-gray-50 rounded-xl border border-gray-100 p-4 space-y-2">
+          ${checkItems.map(item => `
+            <label class="checklist-item flex items-center space-x-3 cursor-pointer p-2 rounded-lg hover:bg-white transition-colors ${cl[item.key]?'done':''}"
+              onclick="toggleChecklistModal('${item.key}', ${!cl[item.key]})">
+              <div class="checklist-dot ${cl[item.key]?'done':'pending'}">
+                ${cl[item.key]?'<i class="fas fa-check text-[10px]"></i>':'<i class="fas '+item.icon+' text-[10px]"></i>'}
+              </div>
+              <span class="text-sm font-medium ${cl[item.key]?'line-through text-gray-400':'text-gray-700'}">${item.label}</span>
+              <div class="ml-auto w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 transition-all
+                ${cl[item.key]?'bg-green-500 border-green-500':'bg-white border-gray-300'}">
+                ${cl[item.key]?'<i class="fas fa-check text-white text-[10px]"></i>':''}
+              </div>
+            </label>
+          `).join('')}
+        </div>
+      </div>
+
+      <div>
+        <label class="block text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Notes</label>
+        <textarea rows="2" oninput="membreEnCours.notes=this.value"
+          class="w-full rounded-lg border-gray-200 border text-sm p-2 focus:ring-2 focus:ring-indigo-400 focus:outline-none resize-none"
+          placeholder="Notes libres...">${esc(m.notes||'')}</textarea>
+      </div>
+    </div>
+  `;
+}
+
+function toggleChecklistModal(key, val) {
+  if (!membreEnCours.checklist) membreEnCours.checklist = { kiwi:false, ba_signe:false, cotisation:false };
+  membreEnCours.checklist[key] = val;
+  renderModalMembre();
+}
+
+function fermerModalMembre() {
+  document.getElementById('modal-membre').classList.add('hidden');
+  membreEnCours = null;
+}
+
+function sauvegarderMembre() {
+  const m = membreEnCours;
+  if (!m.nom || !m.prenom) { alert('Nom et prénom sont obligatoires.'); return; }
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (!m.id) { m.id = res.id; sgMembres.push(m); }
+      else { const idx = sgMembres.findIndex(x => String(x.id) === String(m.id)); if (idx>=0) sgMembres[idx]=m; }
+      fermerModalMembre(); afficherMembres(); afficherKPIsMembres();
+    })
+    .withFailureHandler(err => alert('Erreur : ' + (err.message||err)))
+    .enregistrerMembre(m);
+}
+
+function supprimerMembreActuel() {
+  if (!membreEnCours?.id) return;
+  if (!confirm('Supprimer ce membre définitivement ?')) return;
+  google.script.run
+    .withSuccessHandler(function() {
+      sgMembres = sgMembres.filter(m => String(m.id) !== String(membreEnCours.id));
+      fermerModalMembre(); afficherMembres(); afficherKPIsMembres();
+    })
+    .withFailureHandler(makeSgFailureHandler_('supprimerMembre', 'La suppression du membre a échoué.'))
+    .supprimerMembre(membreEnCours.id);
+}
+
+// ════════════════════════════════════════════════════════
+//  MEMBRES — GÉNÉRATION BA
+// ════════════════════════════════════════════════════════
+function genererBAMembre() {
+  const m = membreEnCours;
+  if (!m?.id) { alert('Sauvegardez d\'abord le membre.'); return; }
+
+  const btn = document.getElementById('btn-generer-ba');
+  if (btn) { btn.disabled=true; btn.innerHTML='<i class="fas fa-spinner fa-spin mr-1"></i>Génération...'; }
+
+  // Détecter le type selon statut
+  const type = m.statut === 'Intervenant' ? 'intervenant' : 'membre';
+
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (btn) { btn.disabled=false; btn.innerHTML='<i class="fas fa-file-signature mr-1.5"></i>Générer BA'; }
+      if (res?.url) {
+        var baUrl = normalizeExternalUrl(res.url);
+        if (baUrl) window.open(baUrl, '_blank', 'noopener,noreferrer');
+        // Cocher ba_signe si succès
+        if (membreEnCours && !membreEnCours.checklist.ba_signe) {
+          // On laisse l'utilisateur cocher manuellement après impression
+        }
+      }
+    })
+    .withFailureHandler(function(err) {
+      if (btn) { btn.disabled=false; btn.innerHTML='<i class="fas fa-file-signature mr-1.5"></i>Générer BA'; }
+      alert('Erreur génération BA : ' + (err.message||err));
+    })
+    .genererBAMembre(m.id, type);
+}
+
+// ════════════════════════════════════════════════════════
+//  RÉUNIONS — AFFICHAGE
+// ════════════════════════════════════════════════════════
+function afficherReunions() {
+  document.getElementById('reunions-loader').classList.add('hidden');
+  const grid = document.getElementById('reunions-grid');
+
+  if (!sgReunions.length) {
+    document.getElementById('reunions-empty').classList.remove('hidden');
+    grid.innerHTML = '';
+    return;
+  }
+  document.getElementById('reunions-empty').classList.add('hidden');
+
+  grid.innerHTML = sgReunions.map(r => {
+    const badgeClass = { 'Planifié':'badge-planifie','En cours':'badge-en-cours','Terminé':'badge-termine','Annulé':'badge-annule' }[r.statut]||'badge-planifie';
+    const cl = r.checklist || {};
+    const done = ['odj_envoye','cr_redige','cr_relu','cr_signe','cr_archive'].filter(k => cl[k]).length;
+    const dateFr = r.date ? new Date(r.date).toLocaleDateString('fr-FR',{day:'2-digit',month:'long',year:'numeric'}) : '—';
+    const typeIcons = {CA:'fa-gavel',Bureau:'fa-user-tie',AG:'fa-landmark',AGO:'fa-landmark',AGE:'fa-file-contract',Pleniere:'fa-users',Autre:'fa-calendar'};
+    const icon = typeIcons[r.type] || 'fa-calendar';
+    const isAG = r.type==='AG'||r.type==='AGO'||r.type==='AGE';
+    const odjUrl = normalizeExternalUrl(r.odj_url);
+    const crUrl = normalizeExternalUrl(r.cr_url);
+
+    return `
+    <div class="reunion-card bg-white rounded-xl border border-gray-100 shadow-sm p-5 cursor-pointer" onclick="ouvrirDetailReunion('${r.id}')">
+      <div class="flex items-start justify-between mb-3">
+        <div class="flex items-center space-x-3">
+          <div class="w-10 h-10 ${isAG?'bg-amber-100':'bg-indigo-100'} rounded-xl flex items-center justify-center">
+            <i class="fas ${icon} ${isAG?'text-amber-600':'text-indigo-600'}"></i>
+          </div>
+          <div>
+            <h3 class="font-bold text-gray-800">${r.type||'Réunion'}</h3>
+            <p class="text-xs text-gray-400">${dateFr}${r.heure?' · '+r.heure:''}</p>
+          </div>
+        </div>
+        <span class="inline-flex px-2 py-0.5 rounded-full text-xs font-semibold ${badgeClass}">${r.statut}</span>
+      </div>
+      <p class="text-xs text-gray-500 mb-3"><i class="fas fa-location-dot mr-1"></i>${r.lieu||'Lieu non défini'}</p>
+      <div class="flex items-center space-x-1">
+        ${['ODJ','CR rédigé','CR relu','CR signé','Archivé'].map((l,i) => {
+          const keys=['odj_envoye','cr_redige','cr_relu','cr_signe','cr_archive'];
+          return `<span title="${l}" class="w-6 h-6 rounded-full text-[10px] flex items-center justify-center font-bold ${cl[keys[i]]?'bg-green-500 text-white':'bg-gray-100 text-gray-400'}">${i+1}</span>`;
+        }).join('')}
+        <span class="ml-2 text-xs text-gray-400">${done}/5</span>
+        ${odjUrl?`<a href="${odjUrl}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()" class="ml-auto text-xs text-indigo-500 hover:underline"><i class="fas fa-list-ol mr-1"></i>ODJ</a>`:''}
+        ${crUrl?`<a href="${crUrl}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()" class="ml-1 text-xs text-green-600 hover:underline"><i class="fas fa-file-alt mr-1"></i>CR</a>`:''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ════════════════════════════════════════════════════════
+//  RÉUNIONS — DÉTAIL
+// ════════════════════════════════════════════════════════
+function ouvrirDetailReunion(reunionId) {
+  reunionDetailId = reunionId;
+  const r = sgReunions.find(x => String(x.id) === String(reunionId));
+  if (!r) return;
+  document.getElementById('reunions-liste-view').classList.add('hidden');
+  document.getElementById('reunions-detail-view').classList.remove('hidden');
+  renderDetailReunion(r);
+}
+
+function fermerDetailReunion() {
+  reunionDetailId = null;
+  document.getElementById('reunions-detail-view').classList.add('hidden');
+  document.getElementById('reunions-liste-view').classList.remove('hidden');
+}
+
+function renderDetailReunion(r) {
+  const cl   = r.checklist || { odj_envoye:false, cr_redige:false, cr_relu:false, cr_signe:false, cr_archive:false };
+  const odj  = r.ordresDuJour || [];
+  const isAG = r.type==='AG'||r.type==='AGO'||r.type==='AGE';
+  const dateFr = r.date ? new Date(r.date).toLocaleDateString('fr-FR',{weekday:'long',day:'2-digit',month:'long',year:'numeric'}) : '—';
+  const agCl   = r.agChecklist || {};
+  const odjUrl = normalizeExternalUrl(r.odj_url);
+  const crUrl = normalizeExternalUrl(r.cr_url);
+  const meetUrl = normalizeExternalUrl(r.meetLink);
+
+  document.getElementById('reunion-detail-content').innerHTML = `
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <!-- Col gauche : ODJ + Notes -->
+      <div class="lg:col-span-2 space-y-6">
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-6">
+          <div class="flex items-start justify-between">
+            <div>
+              <h2 class="text-2xl font-bold text-gray-900">${r.type||'Réunion'}</h2>
+              <p class="text-gray-500 mt-1 capitalize">${dateFr}</p>
+              <p class="text-sm text-gray-400 mt-1">
+                <i class="fas fa-location-dot mr-1"></i>${r.lieu||'—'}
+                ${r.heure?'<span class="ml-3"><i class="fas fa-clock mr-1"></i>'+r.heure+'</span>':''}
+                ${r.nbPresents?'<span class="ml-3"><i class="fas fa-users mr-1"></i>'+r.nbPresents+' présents</span>':''}
+              </p>
+              ${meetUrl?`<p class="text-sm text-indigo-500 mt-1"><i class="fas fa-video mr-1"></i><a href="${meetUrl}" target="_blank" rel="noopener noreferrer" class="hover:underline">${esc(r.meetLink)}</a></p>`:''}
+            </div>
+            <button onclick="ouvrirModalReunion('${r.id}')" class="text-sm text-gray-400 hover:text-indigo-600 border border-gray-200 rounded-lg px-3 py-1.5">
+              <i class="fas fa-pen mr-1"></i>Modifier
+            </button>
+          </div>
+        </div>
+
+        <!-- ODJ -->
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-6">
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="font-bold text-gray-800 text-lg"><i class="fas fa-list-ol mr-2 text-indigo-400"></i>Ordre du Jour</h3>
+            <button onclick="ajouterPointODJ('${r.id}')" class="text-sm text-indigo-600 hover:bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-1.5 font-medium">
+              <i class="fas fa-plus mr-1"></i>Ajouter
+            </button>
+          </div>
+          <div id="odj-list-${r.id}" class="space-y-2">
+            ${odj.length===0
+              ? '<p class="text-gray-400 text-sm italic text-center py-6 bg-gray-50 rounded-lg border border-dashed border-gray-200">Aucun point à l\'ordre du jour</p>'
+              : odj.map((pt, idx) => renderODJItem(r.id, pt, idx)).join('')
+            }
+          </div>
+        </div>
+
+        <!-- Checklist AG spécifique -->
+        ${isAG ? renderAGChecklist(r.id, r.type, agCl) : ''}
+
+        <!-- Notes -->
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-6">
+          <h3 class="font-bold text-gray-800 mb-3"><i class="fas fa-sticky-note mr-2 text-yellow-400"></i>Notes & PV</h3>
+          <textarea rows="5" placeholder="Notes de séance, décisions prises..."
+            oninput="updateReunionNotes('${r.id}', this.value)"
+            class="w-full rounded-lg border-gray-200 border text-sm p-3 focus:ring-2 focus:ring-indigo-400 focus:outline-none resize-none">${esc(r.notes||'')}</textarea>
+        </div>
+      </div>
+
+      <!-- Col droite -->
+      <div class="space-y-6">
+        <!-- Checklist procédure CR -->
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-6">
+          <h3 class="font-bold text-gray-800 mb-4"><i class="fas fa-list-check mr-2 text-green-500"></i>Procédure CR</h3>
+          <div class="space-y-2">
+            ${[
+              {key:'odj_envoye', label:'ODJ préparé & envoyé',        icon:'fa-paper-plane'},
+              {key:'cr_redige',  label:'CR rédigé depuis le modèle',   icon:'fa-file-pen'},
+              {key:'cr_relu',    label:'CR relu (checklist JIS)',       icon:'fa-glasses'},
+              {key:'cr_signe',   label:'CR signé (Président + SG)',     icon:'fa-signature'},
+              {key:'cr_archive', label:'CR archivé (classeur + Drive)', icon:'fa-box-archive'}
+            ].map((step,i) => `
+              <div class="checklist-item flex items-center space-x-3 p-2 rounded-lg hover:bg-gray-50 cursor-pointer ${cl[step.key]?'done':''}"
+                onclick="toggleChecklistReunion('${r.id}','${step.key}')">
+                <div class="checklist-dot ${cl[step.key]?'done':'pending'}">
+                  ${cl[step.key]?'<i class="fas fa-check text-[10px]"></i>':(i+1)}
+                </div>
+                <p class="text-sm font-medium ${cl[step.key]?'line-through text-gray-400':'text-gray-700'}">${step.label}</p>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-6">
+          <h3 class="font-bold text-gray-800 mb-4"><i class="fas fa-wand-magic-sparkles mr-2 text-indigo-400"></i>Actions</h3>
+          <div class="space-y-2">
+            <!-- ODJ -->
+            <div class="flex space-x-2">
+              <button id="btn-gen-odj-${r.id}" onclick="genererODJReunion('${r.id}', false)"
+                class="flex-1 flex items-center px-3 py-2.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg text-sm font-medium transition-colors border border-blue-100">
+                <i class="fas fa-list-ol mr-2 text-blue-500"></i>Générer l'ODJ
+              </button>
+              <button onclick="genererODJReunion('${r.id}', true)" title="ODJ avec indicateurs mensuels"
+                class="px-3 py-2.5 bg-blue-50 hover:bg-blue-100 text-blue-600 rounded-lg text-sm border border-blue-100" title="Avec indicateurs">
+                <i class="fas fa-chart-bar"></i>
+              </button>
+            </div>
+            ${odjUrl?`<a href="${odjUrl}" target="_blank" rel="noopener noreferrer" class="w-full flex items-center px-3 py-2.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg text-sm font-medium transition-colors border border-blue-100"><i class="fab fa-google-drive mr-2 text-blue-500"></i>Ouvrir l'ODJ</a>`:''}
+            <!-- CR -->
+            <button id="btn-gen-cr-${r.id}" onclick="genererCR('${r.id}')"
+              class="w-full flex items-center px-3 py-2.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-sm font-medium transition-colors border border-indigo-100">
+              <i class="fas fa-file-circle-plus mr-2 text-indigo-500"></i>Générer le CR
+            </button>
+            ${crUrl?`<a href="${crUrl}" target="_blank" rel="noopener noreferrer" class="w-full flex items-center px-3 py-2.5 bg-green-50 hover:bg-green-100 text-green-700 rounded-lg text-sm font-medium transition-colors border border-green-100"><i class="fab fa-google-drive mr-2 text-green-500"></i>Ouvrir le CR</a>`:''}
+            <!-- Vote -->
+            <button onclick="ouvrirModalVote(null,'${r.id}')"
+              class="w-full flex items-center px-3 py-2.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg text-sm font-medium transition-colors border border-amber-100">
+              <i class="fas fa-gavel mr-2 text-amber-500"></i>Enregistrer un vote
+            </button>
+            <button onclick="supprimerReunionConfirm('${r.id}')"
+              class="w-full flex items-center px-3 py-2.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-lg text-sm font-medium transition-colors border border-red-100">
+              <i class="fas fa-trash-alt mr-2"></i>Supprimer
+            </button>
+          </div>
+        </div>
+
+        <!-- Votes liés -->
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-6">
+          <h3 class="font-bold text-gray-800 mb-3"><i class="fas fa-gavel mr-2 text-purple-400"></i>Votes de cette réunion</h3>
+          <div id="votes-reunion-${r.id}" class="space-y-2 text-sm text-gray-400 italic">Chargement...</div>
+        </div>
+      </div>
+    </div>`;
+
+  chargerVotesReunion(r.id);
+}
+
+function renderAGChecklist(reunionId, type, agCl) {
+  const steps = [
+    { key:'convocation',    label: 'Convocation envoyée (15j avant minimum)', icon:'fa-envelope' },
+    { key:'quorum_verifie', label: 'Quorum vérifié (⅓ des membres)',           icon:'fa-users' },
+    { key:'emargement',     label: 'Feuille d\'émargement préparée',            icon:'fa-clipboard-list' },
+    { key:'votes_ag',       label: 'Votes réalisés (élections, résolutions)',    icon:'fa-check-to-slot' },
+    { key:'pv_redige',      label: 'PV d\'AG rédigé',                           icon:'fa-file-pen' },
+    { key:'pv_signe',       label: 'PV signé (Président + SG)',                 icon:'fa-signature' },
+    { key:'pv_archive',     label: 'PV archivé (classeur + Drive)',             icon:'fa-box-archive' },
+    { key:'prefecture',     label: 'Déclaration en préfecture (si changements)',icon:'fa-building-columns' }
+  ];
+  return `
+    <div class="bg-white rounded-xl border-2 border-amber-200 shadow-sm p-6">
+      <h3 class="font-bold text-amber-800 mb-4"><i class="fas fa-landmark mr-2 text-amber-500"></i>Checklist ${type} — Obligations légales</h3>
+      <div class="space-y-2">
+        ${steps.map(step => `
+          <div class="checklist-item flex items-center space-x-3 p-2 rounded-lg hover:bg-amber-50 cursor-pointer ${agCl[step.key]?'done':''}"
+            onclick="toggleAGChecklist('${reunionId}','${step.key}')">
+            <div class="checklist-dot ${agCl[step.key]?'done':'pending'}">
+              ${agCl[step.key]?'<i class="fas fa-check text-[10px]"></i>':'<i class="fas '+step.icon+' text-[10px]"></i>'}
+            </div>
+            <p class="text-sm font-medium ${agCl[step.key]?'line-through text-gray-400':'text-gray-700'}">${step.label}</p>
+          </div>
+        `).join('')}
+      </div>
+    </div>`;
+}
+
+function toggleAGChecklist(reunionId, key) {
+  const r = sgReunions.find(x => String(x.id) === String(reunionId));
+  if (!r) return;
+  if (!r.agChecklist) r.agChecklist = {};
+  r.agChecklist[key] = !r.agChecklist[key];
+  renderDetailReunion(r);
+  sauvegarderODJ(r);
+}
+
+function renderODJItem(reunionId, point, idx) {
+  const types = ['Information','Discussion','Vote','Divers'];
+  return `
+    <div class="odj-item flex items-center space-x-3 p-3 bg-gray-50 rounded-lg border border-gray-100 group">
+      <span class="w-7 h-7 bg-indigo-100 text-indigo-600 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0">${idx+1}</span>
+      <input type="text" value="${esc(point.titre||'')}" placeholder="Point de l'ordre du jour..."
+        oninput="updateODJItem('${reunionId}',${idx},'titre',this.value)"
+        class="flex-1 bg-transparent border-none text-sm focus:outline-none focus:ring-0 text-gray-700 font-medium">
+      <select onchange="updateODJItem('${reunionId}',${idx},'type',this.value)"
+        class="text-xs border border-gray-200 rounded text-gray-500 py-0.5 px-1 focus:outline-none bg-white">
+        ${types.map(t=>`<option ${point.type===t?'selected':''}>${t}</option>`).join('')}
+      </select>
+      <button onclick="supprimerPointODJ('${reunionId}',${idx})" class="text-gray-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity">
+        <i class="fas fa-times text-xs"></i>
+      </button>
+    </div>`;
+}
+
+// ODJ helpers
+function ajouterPointODJ(reunionId) {
+  const r = sgReunions.find(x=>String(x.id)===String(reunionId));
+  if (!r) return;
+  if (!r.ordresDuJour) r.ordresDuJour = [];
+  r.ordresDuJour.push({ titre:'', type:'Information' });
+  sauvegarderODJ(r); renderDetailReunion(r);
+}
+function supprimerPointODJ(reunionId, idx) {
+  const r = sgReunions.find(x=>String(x.id)===String(reunionId));
+  if (!r?.ordresDuJour) return;
+  r.ordresDuJour.splice(idx,1); sauvegarderODJ(r); renderDetailReunion(r);
+}
+function updateODJItem(reunionId, idx, field, value) {
+  const r = sgReunions.find(x=>String(x.id)===String(reunionId));
+  if (!r?.ordresDuJour?.[idx]) return;
+  r.ordresDuJour[idx][field] = value; sauvegarderODJ(r);
+}
+function updateReunionNotes(reunionId, notes) {
+  const r = sgReunions.find(x=>String(x.id)===String(reunionId));
+  if (!r) return; r.notes = notes; sauvegarderODJ(r);
+}
+function toggleChecklistReunion(reunionId, key) {
+  const r = sgReunions.find(x=>String(x.id)===String(reunionId));
+  if (!r) return;
+  if (!r.checklist) r.checklist={};
+  r.checklist[key] = !r.checklist[key]; renderDetailReunion(r); sauvegarderODJ(r);
+}
+
+let odjSaveTimer = null;
+function sauvegarderODJ(reunion) {
+  clearTimeout(odjSaveTimer);
+  odjSaveTimer = setTimeout(function() {
+    google.script.run
+      .withFailureHandler(makeSgFailureHandler_('enregistrerReunion(auto-save)', 'La sauvegarde automatique de la réunion a échoué.'))
+      .enregistrerReunion(reunion);
+  }, 500);
+}
+
+// ════════════════════════════════════════════════════════
+//  RÉUNIONS — GÉNÉRATION DOCUMENTS
+// ════════════════════════════════════════════════════════
+function genererODJReunion(reunionId, avecIndicateurs) {
+  const btnId = 'btn-gen-odj-' + reunionId;
+  const btn = document.getElementById(btnId);
+  if (btn) { btn.disabled=true; btn.innerHTML='<i class="fas fa-spinner fa-spin mr-2"></i>Génération...'; }
+
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (btn) { btn.disabled=false; btn.innerHTML='<i class="fas fa-list-ol mr-2 text-blue-500"></i>Générer l\'ODJ'; }
+      const r = sgReunions.find(x=>String(x.id)===String(reunionId));
+      if (r && res.url) r.odj_url = res.url;
+      if (res.url) {
+        var odjUrl = normalizeExternalUrl(res.url);
+        if (odjUrl) window.open(odjUrl,'_blank','noopener,noreferrer');
+      }
+      const updated = sgReunions.find(x=>String(x.id)===String(reunionId));
+      if (updated) renderDetailReunion(updated);
+    })
+    .withFailureHandler(function(err) {
+      if (btn) { btn.disabled=false; btn.innerHTML='<i class="fas fa-list-ol mr-2 text-blue-500"></i>Générer l\'ODJ'; }
+      alert('Erreur ODJ : ' + (err.message||err));
+    })
+    .genererODJReunion(reunionId, avecIndicateurs);
+}
+
+function genererCR(reunionId) {
+  const btn = document.getElementById('btn-gen-cr-' + reunionId);
+  if (btn) { btn.disabled=true; btn.innerHTML='<i class="fas fa-spinner fa-spin mr-2"></i>Génération...'; }
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (btn) { btn.disabled=false; btn.innerHTML='<i class="fas fa-file-circle-plus mr-2 text-indigo-500"></i>Générer le CR'; }
+      const r = sgReunions.find(x=>String(x.id)===String(reunionId));
+      if (r && res.url) r.cr_url = res.url;
+      if (res.url) {
+        var crUrl = normalizeExternalUrl(res.url);
+        if (crUrl) window.open(crUrl,'_blank','noopener,noreferrer');
+      }
+      const updated = sgReunions.find(x=>String(x.id)===String(reunionId));
+      if (updated) renderDetailReunion(updated);
+    })
+    .withFailureHandler(function(err) {
+      if (btn) { btn.disabled=false; btn.innerHTML='<i class="fas fa-file-circle-plus mr-2 text-indigo-500"></i>Générer le CR'; }
+      alert('Erreur CR : ' + (err.message||err));
+    })
+    .genererCRReunion(reunionId);
+}
+
+function supprimerReunionConfirm(reunionId) {
+  if (!confirm('Supprimer cette réunion définitivement ?')) return;
+  google.script.run
+    .withSuccessHandler(function() {
+      sgReunions = sgReunions.filter(r=>String(r.id)!==String(reunionId));
+      fermerDetailReunion(); afficherReunions();
+    })
+    .withFailureHandler(makeSgFailureHandler_('supprimerReunion', 'La suppression de la réunion a échoué.'))
+    .supprimerReunion(reunionId);
+}
+
+// ════════════════════════════════════════════════════════
+//  RÉUNIONS — MODAL
+// ════════════════════════════════════════════════════════
+function ouvrirModalReunion(reunionId) {
+  reunionEnCours = reunionId
+    ? JSON.parse(JSON.stringify(sgReunions.find(r=>String(r.id)===String(reunionId))||{}))
+    : { id:null, type:'CA', statut:'Planifié', date:'', heure:'', lieu:'', nbPresents:0, meetLink:'' };
+
+  document.getElementById('modal-reunion-title').textContent = reunionId?'Modifier la réunion':'Nouvelle réunion';
+  document.getElementById('reunion-type').value   = reunionEnCours.type    || 'CA';
+  document.getElementById('reunion-statut').value = reunionEnCours.statut  || 'Planifié';
+  document.getElementById('reunion-date').value   = reunionEnCours.date    || '';
+  document.getElementById('reunion-heure').value  = reunionEnCours.heure   || '';
+  document.getElementById('reunion-lieu').value   = reunionEnCours.lieu    || '';
+  document.getElementById('reunion-presents').value = reunionEnCours.nbPresents || 0;
+  const meetInput = document.getElementById('reunion-meet');
+  if (meetInput) meetInput.value = reunionEnCours.meetLink || '';
+  document.getElementById('modal-reunion').classList.remove('hidden');
+}
+function fermerModalReunion() { document.getElementById('modal-reunion').classList.add('hidden'); reunionEnCours=null; }
+function sauvegarderReunion() {
+  const r = reunionEnCours || {};
+  r.type      = document.getElementById('reunion-type').value;
+  r.statut    = document.getElementById('reunion-statut').value;
+  r.date      = document.getElementById('reunion-date').value;
+  r.heure     = document.getElementById('reunion-heure').value;
+  r.lieu      = document.getElementById('reunion-lieu').value;
+  r.nbPresents= parseInt(document.getElementById('reunion-presents').value)||0;
+  const meetInput = document.getElementById('reunion-meet');
+  if (meetInput) r.meetLink = normalizeExternalUrl(meetInput.value);
+
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (!r.id) { r.id=res.id; sgReunions.unshift(r); }
+      else { const idx=sgReunions.findIndex(x=>String(x.id)===String(r.id)); if(idx>=0) sgReunions[idx]=r; }
+      fermerModalReunion(); afficherReunions();
+      if (reunionDetailId) { const u=sgReunions.find(x=>String(x.id)===String(reunionDetailId)); if(u) renderDetailReunion(u); }
+    })
+    .withFailureHandler(err => alert('Erreur : '+(err.message||err)))
+    .enregistrerReunion(r);
+}
+
+// ════════════════════════════════════════════════════════
+//  VOTES
+// ════════════════════════════════════════════════════════
+function chargerVotes() {
+  document.getElementById('votes-loader').classList.remove('hidden');
+  google.script.run
+    .withSuccessHandler(function(votes) {
+      sgVotes = votes||[];
+      document.getElementById('votes-loader').classList.add('hidden');
+      afficherVotes();
+    })
+    .withFailureHandler(makeSgFailureHandler_('obtenirVotes(all)', 'Le chargement des votes a échoué.'))
+    .obtenirVotes(null);
+}
+
+function chargerVotesReunion(reunionId) {
+  const container = document.getElementById('votes-reunion-'+reunionId);
+  if (!container) return;
+  google.script.run
+    .withSuccessHandler(function(votes) {
+      if (!votes?.length) { container.innerHTML='<p class="text-gray-400 text-sm italic">Aucun vote pour cette réunion.</p>'; return; }
+      container.innerHTML = votes.map(v => `
+        <div class="flex items-center justify-between p-2 rounded-lg bg-gray-50">
+          <span class="text-sm font-medium text-gray-700 flex-1 truncate">${v.sujet||'—'}</span>
+          <span class="ml-2 text-xs font-bold px-2 py-0.5 rounded-full
+            ${v.resultat==='Adopté'?'bg-green-100 text-green-700':v.resultat==='Rejeté'?'bg-red-100 text-red-600':'bg-purple-100 text-purple-700'}">
+            ${v.resultat}
+          </span>
+        </div>`).join('');
+    })
+      .withFailureHandler(makeSgFailureHandler_('obtenirVotes(reunion)', 'Le chargement des votes de la réunion a échoué.'))
+    .obtenirVotes(reunionId);
+}
+
+function afficherVotes() {
+  const list  = document.getElementById('votes-list');
+  const empty = document.getElementById('votes-empty');
+  if (!sgVotes?.length) { empty.classList.remove('hidden'); list.classList.add('hidden'); return; }
+  empty.classList.add('hidden'); list.classList.remove('hidden');
+  list.innerHTML = sgVotes.map(v => `
+    <div class="p-4 flex items-center space-x-4">
+      <div class="flex-1">
+        <p class="font-medium text-gray-800">${v.sujet||'—'}</p>
+        <p class="text-xs text-gray-400">${v.date||''} · ${v.type||'CA'}</p>
+      </div>
+      <div class="flex items-center space-x-3 text-sm">
+        <span class="text-green-600 font-semibold">✓ ${v.pour}</span>
+        <span class="text-red-500 font-semibold">✗ ${v.contre}</span>
+        <span class="text-gray-400">— ${v.abstentions}</span>
+      </div>
+      <span class="text-xs font-bold px-3 py-1 rounded-full
+        ${v.resultat==='Adopté'?'bg-green-100 text-green-700':v.resultat==='Rejeté'?'bg-red-100 text-red-600':v.resultat==='Quorum non atteint'?'bg-purple-100 text-purple-700':'bg-gray-100 text-gray-500'}">
+        ${v.resultat}
+      </span>
+    </div>`).join('');
+}
+
+// ════════════════════════════════════════════════════════
+//  VOTES — MODAL + BALOTILO
+// ════════════════════════════════════════════════════════
+function ouvrirModalVote(voteId, reunionId) {
+  document.getElementById('vote-sujet').value       = '';
+  document.getElementById('vote-type').value        = 'CA';
+  document.getElementById('vote-date').value        = new Date().toISOString().split('T')[0];
+  document.getElementById('vote-total').value       = '';
+  document.getElementById('vote-presents').value    = '';
+  document.getElementById('vote-pour').value        = '';
+  document.getElementById('vote-contre').value      = '';
+  document.getElementById('vote-abstentions').value = '';
+  document.getElementById('vote-balotilo-url').value= '';
+  document.getElementById('vote-reunion-id').value  = reunionId||'';
+  afficherBalotiloStatus('', false);
+  calculerQuorumLive();
+  document.getElementById('modal-vote').classList.remove('hidden');
+}
+function fermerModalVote() { document.getElementById('modal-vote').classList.add('hidden'); }
+
+// Import Balotilo
+let balotiloTimer = null;
+function onBalotiloUrlChange(url) {
+  clearTimeout(balotiloTimer);
+  if (!url.includes('balotilo.com')) { afficherBalotiloStatus('', false); return; }
+  afficherBalotiloStatus('Récupération...', null);
+  balotiloTimer = setTimeout(() => importerBalotilo(url), 800);
+}
+
+function importerBalotilo(url) {
+  afficherBalotiloStatus('<i class="fas fa-spinner fa-spin mr-1"></i>Importation...', null);
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (!res.success) { afficherBalotiloStatus('❌ ' + (res.error||'Impossible de récupérer les résultats'), false); return; }
+      document.getElementById('vote-pour').value        = res.pour        || 0;
+      document.getElementById('vote-contre').value      = res.contre      || 0;
+      document.getElementById('vote-abstentions').value = res.abstentions || 0;
+      if (res.titre && !document.getElementById('vote-sujet').value) {
+        document.getElementById('vote-sujet').value = res.titre;
+      }
+      afficherBalotiloStatus('✅ Résultats importés — Pour: '+res.pour+' | Contre: '+res.contre+' | Abst: '+res.abstentions, true);
+      calculerQuorumLive();
+    })
+    .withFailureHandler(function(err) {
+      afficherBalotiloStatus('❌ Erreur: '+(err.message||err), false);
+    })
+    .importerResultatsBalotilo(url);
+}
+
+function afficherBalotiloStatus(msg, ok) {
+  const el = document.getElementById('balotilo-status');
+  if (!el) return;
+  if (!msg) { el.classList.add('hidden'); return; }
+  el.classList.remove('hidden');
+  el.className = 'mt-2 text-xs p-2 rounded ' + (ok===true?'bg-green-50 text-green-700':ok===false?'bg-red-50 text-red-600':'bg-blue-50 text-blue-600');
+  el.innerHTML = msg;
+}
+
+function calculerQuorumLive() {
+  const type     = document.getElementById('vote-type').value;
+  const total    = parseInt(document.getElementById('vote-total').value)||0;
+  const presents = parseInt(document.getElementById('vote-presents').value)||0;
+  const pour     = parseInt(document.getElementById('vote-pour').value)||0;
+  const contre   = parseInt(document.getElementById('vote-contre').value)||0;
+  const qInd     = document.getElementById('quorum-indicator');
+  const rPrev    = document.getElementById('vote-result-preview');
+
+  if (!total) {
+    if (qInd) { qInd.className='rounded-lg p-3 text-sm font-medium text-center border quorum-na'; qInd.textContent='Entrez le nombre de membres total'; }
+    if (rPrev) { rPrev.className='rounded-xl p-4 text-center font-bold text-lg border-2 vote-attente'; rPrev.textContent='—'; }
+    return;
+  }
+
+  const quorumMin    = (type==='CA'||type==='Bureau') ? Math.ceil(total/2) : Math.ceil(total/3);
+  const quorumAtteint = presents >= quorumMin;
+  const votants       = pour + contre;
+  let resultat;
+
+  if (type==='AG_Dissolution')  resultat = (quorumAtteint&&votants>0&&pour>=votants*0.75)?'Adopté':'Rejeté';
+  else if (!quorumAtteint)      resultat = 'Quorum non atteint';
+  else if (pour > contre)       resultat = 'Adopté';
+  else if (contre > pour)       resultat = 'Rejeté';
+  else                          resultat = 'Égalité → Président';
+
+  if (qInd) {
+    qInd.className = 'rounded-lg p-3 text-sm font-medium text-center border ' + (quorumAtteint?'quorum-ok':'quorum-ko');
+    qInd.textContent = quorumAtteint?`✓ Quorum atteint (${presents}/${quorumMin} requis)`:`✗ Quorum non atteint — ${presents}/${quorumMin} requis`;
+  }
+  const resClass = {Adopté:'vote-adopte',Rejeté:'vote-rejete','Quorum non atteint':'vote-quorum','Égalité → Président':'vote-attente'}[resultat]||'vote-attente';
+  if (rPrev) { rPrev.className='rounded-xl p-4 text-center font-bold text-lg border-2 '+resClass; rPrev.textContent=resultat; }
+}
+
+function sauvegarderVote() {
+  const voteData = {
+    id:null, reunionId: document.getElementById('vote-reunion-id').value||'',
+    date:        document.getElementById('vote-date').value,
+    sujet:       document.getElementById('vote-sujet').value,
+    type:        document.getElementById('vote-type').value,
+    nbTotal:     parseInt(document.getElementById('vote-total').value)||0,
+    presents:    parseInt(document.getElementById('vote-presents').value)||0,
+    pour:        parseInt(document.getElementById('vote-pour').value)||0,
+    contre:      parseInt(document.getElementById('vote-contre').value)||0,
+    abstentions: parseInt(document.getElementById('vote-abstentions').value)||0,
+    balotiloUrl: document.getElementById('vote-balotilo-url').value||''
+  };
+  if (!voteData.sujet) { alert('Le sujet du vote est obligatoire.'); return; }
+  google.script.run
+    .withSuccessHandler(function(res) {
+      voteData.id=res.id; voteData.resultat=res.resultat;
+      sgVotes.unshift(voteData); fermerModalVote(); afficherVotes();
+      if (voteData.reunionId) chargerVotesReunion(voteData.reunionId);
+    })
+    .withFailureHandler(err => alert('Erreur : '+(err.message||err)))
+    .enregistrerVote(voteData);
+}
+
+// ════════════════════════════════════════════════════════
+//  UTILS
+// ════════════════════════════════════════════════════════
+function esc(v) {
+  return String(v||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                       .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+}
+
+function normalizeExternalUrl(url) {
+  var value = String(url || '').trim();
+  if (!value) return '';
+  if (/^(https?:|mailto:|tel:)/i.test(value)) return value;
+  if (value.indexOf('//') === 0) return 'https:' + value;
+  if (/^[\w.-]+\.[A-Za-z]{2,}([/:?#].*)?$/i.test(value)) return 'https://' + value;
+  return value;
+}
+
+function mettreAJourInfosQuorum() { calculerQuorumLive(); }
+</script>
