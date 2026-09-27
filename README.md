@@ -1,58 +1,74 @@
 # JEDI
 
-> ERP métier pour piloter les études, les documents et la vie administrative d'une Junior-Entreprise.
-
 ![Google Apps Script](https://img.shields.io/badge/Google%20Apps%20Script-4285F4?logo=google&logoColor=white)
 ![JavaScript](https://img.shields.io/badge/JavaScript-ES5%2B-F7DF1E?logo=javascript&logoColor=111111)
 ![Licence MIT](https://img.shields.io/badge/licence-MIT-2ea44f)
 
-JEDI centralise les flux opérationnels de **Junior INSA Services** dans Google Workspace : suivi des études, génération de livrables, échanges Google Chat et administration de l'association.
+> A Google Workspace document and operations layer for French Junior-Entreprises.
 
-## Fonctionnalités
+## Public repository scope
 
-- **Gestion des études** : suivi des informations, intervenants, documents et synchronisation Drive / Firestore.
-- **Génération documentaire** : création de conventions, devis, bons de commande, comptes rendus et documents génériques à partir de modèles Google Docs et Slides.
-- **Secrétariat général** : membres, réunions, votes, licences, RGPD et configuration métier.
-- **Support opérationnel** : signalement d'incidents et notifications Google Chat.
-- **Interfaces web** : tableaux de bord HTML intégrés aux Google Apps Script.
+This public repository contains the **document generation features and Google Workspace integrations** of JEDI. It is the open technical showcase of the Apps Script layer used to generate and manage documents with Google Docs, Google Slides, Google Drive, Gmail, Google Chat and Firestore.
 
-## Architecture
+The complete JEDI ERP is not included in this repository. The full product also contains:
 
-Le projet est volontairement organisé par domaine métier. Cette structure correspond aux fichiers déployés dans Google Apps Script et évite de casser les chemins des templates HTML.
+- an operational dashboard;
+- two React Native mobile applications;
+- a web application for desktop use;
+- additional workflows and features for the complete ERP experience.
+
+Access to the complete source code is available on request. Please contact me through my GitHub profile to discuss the project, a demonstration or the private codebase.
+
+## About JEDI
+
+JEDI is an ERP designed for **French Junior-Entreprises**. It reflects their specific vocabulary, processes and operational needs, including client studies, project documents, members, meetings, approvals and JEH tracking.
+
+The user interface was designed with accessibility and onboarding in mind. Even users who are new to Junior-Entreprises should be able to understand the workflow, follow the lifecycle of a mission and see how JEHs are planned and used throughout a project.
+
+The goal is not only to automate administration, but also to make the operational cycle understandable: from the first study request to document production, review, validation and completion.
+
+## What is included here
+
+- **Document generation**: conventions, quotations, purchase orders, meeting reports and generic documents based on Google Docs and Google Slides templates.
+- **Study workflows**: document statuses, versions, Drive folders and Firestore synchronization.
+- **Google Workspace automation**: Drive, Docs, Slides, Gmail, Google Chat and Apps Script Properties.
+- **Operational support**: Google Chat notifications and support workflows.
+
+## Repository structure
 
 ```text
-generateurDocuments/  Génération et remplissage des documents
-gestionEtudes/        Suivi des études, Drive, Firestore et support
-secretaireGeneral/    Administration, réunions, votes et RGPD
-logos/                Identité visuelle
-docs/                 Documentation de configuration et d'exploitation
+generateurDocuments/  Document generation and Google Workspace workflows
+gestionEtudes/        Study data, Drive, Firestore and support integrations
+secretaireGeneral/    Shared administrative Apps Script features
+logos/                Project visual identity
+docs/                 Configuration and operational documentation
 ```
 
-Les fichiers JavaScript et HTML sont chargés dans un ou plusieurs projets Google Apps Script selon le déploiement retenu. Le code s'appuie sur les services natifs Google Apps Script : Drive, Sheets, Docs, Slides, Gmail, Cache et Properties Service.
+The source is organized by business domain because the files are deployed to Google Apps Script projects and rely on shared global functions. The repository does not contain the React Native applications or the complete dashboard codebase.
 
 ## Installation
 
-1. Créer un projet Google Apps Script lié au Google Drive de l'organisation.
-2. Importer les dossiers métier et leurs fichiers dans le projet Apps Script.
-3. Activer les services avancés utilisés par l'instance, notamment Drive API si la génération documentaire l'exige.
-4. Configurer les Script Properties décrites dans [docs/configuration.md](docs/configuration.md).
-5. Créer les modèles Google Docs / Slides et les dossiers Drive attendus par l'organisation.
-6. Déployer l'application web ou les fonctions nécessaires depuis Apps Script.
+1. Create a Google Apps Script project in the organization's Google Workspace environment.
+2. Import the relevant source folders into the Apps Script project.
+3. Enable the advanced services required by the deployment, including Drive API when Office template conversion is used.
+4. Configure the Script Properties described in [docs/configuration.md](docs/configuration.md).
+5. Create the required Google Docs and Google Slides templates and Drive folders.
+6. Deploy the Apps Script functions or web application required by the instance.
 
-## Configuration et sécurité
+## Configuration and security
 
-Les secrets, tokens, clés Firebase, webhooks et identifiants de ressources sont des **Script Properties**. Ils ne doivent jamais être commités dans Git.
+Secrets, tokens, Firebase keys, webhooks and environment-specific resource identifiers must be stored as **Script Properties**. They must never be committed to Git.
 
-La procédure complète, les noms des propriétés et les droits Google Workspace sont documentés dans [docs/configuration.md](docs/configuration.md). Avant une première publication, vérifier également l'historique Git et révoquer toute clé qui aurait déjà été exposée.
+The configuration names, required permissions and deployment notes are documented in [docs/configuration.md](docs/configuration.md). Before publishing or deploying a copy, review the Git history and revoke any credential that may have been exposed.
 
-## Qualité et limites connues
+## Quality and limitations
 
-Le dépôt contient du code Apps Script exécuté dans l'environnement Google, qui n'est pas entièrement simulable localement. La validation locale couvre donc la syntaxe JavaScript ; les scénarios métier doivent être vérifiés dans un environnement Apps Script de test avec des données non sensibles.
+This repository contains Google Apps Script code that runs inside Google's runtime and cannot be fully simulated locally. Local validation covers JavaScript syntax; business workflows should be tested in a dedicated Apps Script environment with non-sensitive data.
 
-## Contexte
+## Project context
 
-JEDI a été conçu pour répondre aux besoins réels d'une Junior-Entreprise et réduire les tâches répétitives de gestion, de production documentaire et de coordination.
+JEDI was created to reduce repetitive administrative work while making the operating model of a French Junior-Entreprise easier to understand and follow.
 
-## Licence
+## License
 
-Distribué sous licence [MIT](LICENSE).
+The public code is distributed under the [MIT License](LICENSE).
