@@ -8,7 +8,6 @@
 // ────────────────────────────────────────────────────────────
 
 var SG_CONFIG = {
-  driveFolderId: '0AOEs1AL5uGXpUk9PVA',
   sheetName: 'Base de données SG',
   sheets: {
     membres: 'Membres',
@@ -28,6 +27,14 @@ var SG_CONFIG = {
   },
   cacheTtl: 60
 };
+
+function getSGDriveFolderId_() {
+  var folderId = PropertiesService.getScriptProperties().getProperty('SG_DRIVE_FOLDER_ID');
+  if (!folderId) {
+    throw new Error('Script Property manquante: SG_DRIVE_FOLDER_ID');
+  }
+  return String(folderId).trim();
+}
 
 // ────────────────────────────────────────────────────────────
 //  HELPERS PARTAGÉS
@@ -57,7 +64,7 @@ function invalidateCache_(key) {
 function getSGSpreadsheet_() {
   var folder;
   try {
-    folder = DriveApp.getFolderById(SG_CONFIG.driveFolderId);
+    folder = DriveApp.getFolderById(getSGDriveFolderId_());
   } catch (e) {
     folder = DriveApp.getRootFolder();
   }

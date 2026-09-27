@@ -80,7 +80,7 @@ function writeExtraJson(sheet, rowIdx, colIdx, obj) {
 function getFolderByIdOrDefault(id) {
   try { return DriveApp.getFolderById(id); }
   catch (e) {
-    try { return DriveApp.getFolderById(SG_CONFIG.driveFolderId); }
+    try { return DriveApp.getFolderById(getSGDriveFolderId_()); }
     catch (e2) { return DriveApp.getRootFolder(); }
   }
 }

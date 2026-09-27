@@ -115,7 +115,14 @@ function genererDocumentGeneraliste(documentName, destinationFolderId, templateN
 }
 
 var DOC_WORKFLOW_CHAT_URL_ = 'https://chat.google.com/room/AAQApAX9EAQ';
-var DOC_WORKFLOW_WEBHOOK_URL_ = 'https://chat.googleapis.com/v1/spaces/AAQApAX9EAQ/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=gvhEGBSUOfSq6NN-tleGBs4-NQNG1GGFuah5SYG5W18';
+
+function getDocWorkflowWebhookUrl_() {
+  var webhookUrl = PropertiesService.getScriptProperties().getProperty('DOC_WORKFLOW_WEBHOOK_URL');
+  if (!webhookUrl) {
+    throw new Error('Script Property manquante: DOC_WORKFLOW_WEBHOOK_URL');
+  }
+  return String(webhookUrl).trim();
+}
 
 function getDocWorkflowConfig_(docKey) {
   var key = String(docKey || '').trim().toLowerCase();
@@ -629,7 +636,7 @@ function sendWorkflowDocumentRelectureChat_(studyId, docKey, options) {
       checklistText
   };
 
-  var response = UrlFetchApp.fetch(DOC_WORKFLOW_WEBHOOK_URL_, {
+  var response = UrlFetchApp.fetch(getDocWorkflowWebhookUrl_(), {
     method: 'post',
     contentType: 'application/json',
     payload: JSON.stringify(payload),

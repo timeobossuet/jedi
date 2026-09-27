@@ -131,7 +131,7 @@ function deleteLicenceReminderTriggers() {
 function copyFileToSgFolder(fileId) {
 	try {
 		if (!fileId) throw new Error('fileId manquant');
-		var targetFolderId = getConfigValue('licences_folder_id', SG_CONFIG.driveFolderId);
+				var targetFolderId = getConfigValue('licences_folder_id', getSGDriveFolderId_());
 		var folder = getFolderByIdOrDefault(targetFolderId);
 		var file = DriveApp.getFileById(fileId);
 		var copyName = file.getName() + ' (copie pour licences)';
